@@ -1,7 +1,3 @@
-# Welcome to Cloud Functions for Firebase for Python!
-# To get started, simply uncomment the below code or create your own.
-# Deploy with `firebase deploy`
-
 from firebase_functions import https_fn, scheduler_fn
 from firebase_admin import initialize_app, storage
 
@@ -11,9 +7,8 @@ from firebase_admin import initialize_app, storage
 import yfinance as yf
 import time
 import json
-import threading
 
-tickers = [
+share_tickers = [
     # Share Tickers
     "AAPL",      # Apple Inc.
     "MSFT",      # Microsoft Corporation
@@ -35,7 +30,9 @@ tickers = [
     "NFLX",      # Netflix, Inc.
     "INTC",      # Intel Corporation
     "PYPL",      # PayPal Holdings, Inc.
-    
+]
+
+crypto_tickers = [
     # Crypto Tickers
     "BTC-USD",   # Bitcoin
     "ETH-USD",   # Ethereum
@@ -56,36 +53,63 @@ _shares = {}
 
 # Stores information about a particular share
 class Share(dict):
+    # Share Type i.e. share or crypto
     # Short Name e.g. BTC-USD
     # Long Name e.g. Bitcoin
     # Price in a specific currency
     # History is [{Open: xxx, Close: xxx, High: xxx, ...}, ...] from yfinance
-    def __init__(self, short_name: str, long_name: str, price: float, currency: str, history: list[dict]):
+    # Esg is environental, social, and governance scores as a JSON
+    def __init__(self, share_type: str, short_name: str, long_name: str, price: float, currency: str, history: list[dict], esg):
+        self.share_type = share_type
         self.short_name = short_name
         self.long_name = long_name
         self.price = price
         self.currency = currency
         self.history = history
-        dict.__init__(self, short_name=short_name, long_name=long_name, price=price, currency=currency, history=history)
+        self.esg = esg
+        dict.__init__(self, short_name=short_name, long_name=long_name, price=price, currency=currency, history=history, esg=esg)
+        
+
+def _research_share(ticker: str, share_type: str) -> Share:
+    stock = yf.Ticker(ticker)
+    info = stock.info
+    history = stock.history(period="1mo").to_dict("records")
+    try:
+        if share_type == "share":
+            esg = {
+                "total": stock.get_sustainability(as_dict=True)["esgScores"]["totalEsg"],
+                "environment": stock.get_sustainability(as_dict=True)["esgScores"]["environmentScore"],
+                "social": stock.get_sustainability(as_dict=True)["esgScores"]["socialScore"],
+                "governance": stock.get_sustainability(as_dict=True)["esgScores"]["governanceScore"]
+            }
+        else:
+            esg = {}
+
+        return Share(share_type, ticker, info["longName"], info.get("currentPrice", info["open"]), info["currency"], history, esg)
+    except KeyError as e:
+        print(e)
+        print(info)
+        print("Cannot retrieve data, possibly ratelimited?")
 
 
 # Private subroutine to look up shares
-def _research_shares() -> None:
+def _research_shares(share_tickers, crypto_tickers) -> None:
     print("Looking up shares...")
 
-    for ticker in tickers:
-        print(f"Searching {ticker}...")
-        stock = yf.Ticker(ticker)
-        info = stock.info
-        history = stock.history(period="1mo").to_dict("records")
-        try:
-            _shares[ticker] = Share(ticker, info["longName"], info.get("currentPrice", info["open"]), info["currency"], history)
-        except KeyError as e:
-            print(e)
-            print(info)
-            print("Cannot retrieve data, possibly ratelimited?")
-            break
+    for ticker in share_tickers:
+        # Research particular share
+        print(f"Searching share {ticker}...")
+        _shares[ticker] = _research_share(ticker, "share")
 
+        # Wait to avoid being ratelimited
+        time.sleep(2)
+
+    for ticker in crypto_tickers:
+        # Research particular crypto
+        print(f"Searching crypto {ticker}...")
+        _shares[ticker] = _research_share(ticker, "crypto")
+
+        # Wait to avoid being ratelimited
         time.sleep(2)
 
     storage.bucket().blob("stocks.json").upload_from_string(json.dumps(_shares))
@@ -96,7 +120,7 @@ def get_share_information() -> list[Share]:
     try:
         stock_data = storage.bucket().blob("stocks.json").download_as_text()
         load_stocks_from_text(stock_data)
-    except Exception:
+    except:
         pass
 
     return _shares.copy()
@@ -119,16 +143,15 @@ initialize_app()
 
 @https_fn.on_request()
 def get_stocks(req: https_fn.Request) -> https_fn.Response:
-    return https_fn.Response(
-        jsonify_shares(),
-		status=200,
-		headers=[
-			("Content-Type", "application/json")
-		]
-    )
+    return json.loads(jsonify_shares())
+
+
+# @https_fn.on_request()
+# def TODO_REMOVE_research(req: https_fn.Request) -> https_fn.Response:
+#     _research_shares(share_tickers, crypto_tickers)
 
 
 @scheduler_fn.on_schedule(schedule="every 60 minutes")
 def update_stock_list(event: scheduler_fn.ScheduledEvent) -> None:
-    _research_shares()
+    _research_shares(share_tickers, crypto_tickers)
 
