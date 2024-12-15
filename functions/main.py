@@ -1,5 +1,8 @@
 from firebase_functions import https_fn, scheduler_fn
-from firebase_admin import initialize_app, storage
+from firebase_admin import initialize_app, storage, db, auth
+
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail
 
 # This file aims to gather share information and update them
 #   in real time. A default list has been specified.
@@ -67,13 +70,13 @@ class Share(dict):
         self.currency = currency
         self.history = history
         self.esg = esg
-        dict.__init__(self, short_name=short_name, long_name=long_name, price=price, currency=currency, history=history, esg=esg)
+        dict.__init__(self, share_type=share_type, short_name=short_name, long_name=long_name, price=price, currency=currency, history=history, esg=esg)
         
 
 def _research_share(ticker: str, share_type: str) -> Share:
     stock = yf.Ticker(ticker)
     info = stock.info
-    history = stock.history(period="1mo").to_dict("records")
+    history = stock.history(period="1d", interval="1m").to_dict("records")
     try:
         if share_type == "share":
             esg = {
@@ -138,6 +141,108 @@ def load_stocks_from_text(data: str):
     
     _shares = json.loads(data)
 
+
+def _send_email(email, stock_name, price):
+    message = Mail(
+        from_email="act.agenticcorporatetrader@gmail.com",
+        to_emails=email,
+        subject="ACT Price Alert",
+        html_content=f"Your share of {stock_name} has triggered a price alert of {price}!"
+    )
+
+    sg = SendGridAPIClient("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")
+    sg.send(message)
+
+def _check_price_alerts():
+    """ Checks for price alerts and sends notifications """
+    shares = get_share_information()
+
+    admins = db.reference("fundadmin").get()
+
+    for admin_id, admin_info in admins.items():
+        if "purchases" not in admin_info:
+            continue
+
+        try:
+            user = auth.get_user(admin_id)
+        except:
+            # If user does not exist
+            continue
+
+        for purchase_id, purchase_info in admin_info["purchases"].items():
+
+            stock_name = purchase_info["name"]
+
+            share: Share = None
+
+            for s in shares:
+                if s == stock_name:
+                    share = shares[s]
+                    break
+
+            if share == None or "alerts" not in purchase_info:
+                continue
+
+            current_price = share["price"]
+            new_close = share["history"][0]["Open"]
+            old_close = share["history"][1]["Open"]
+
+            for alert_id, alert_info in purchase_info["alerts"].items():
+                price = alert_info["price"]
+
+                if old_close <= price and price <= new_close \
+                    or old_close >= price and price >= new_close \
+                    or current_price == price:
+                    _send_email(user.email, share["long_name"], price)
+
+    managers = db.reference("fundmanager").get()
+
+    for manager_id, manager_info in managers.items():
+        if "clients" not in manager_info:
+            continue
+
+        try:
+            user = auth.get_user(manager_id)
+        except:
+            # If user does not exist
+            continue
+
+        for client_id, client_info in manager_info["clients"].items():
+
+            if "shares" not in client_info:
+                continue
+
+            for share_id, share_info in client_info["shares"].items():
+
+                stock_name = share_info["share_name"]
+
+                share: Share = None
+
+                for s in shares:
+                    if s == stock_name:
+                        share = shares[s]
+                        break
+
+                if share == None or "alerts" not in share_info:
+                    continue
+
+                current_price = share["price"]
+                new_close = share["history"][0]["Open"]
+                old_close = share["history"][1]["Open"]
+
+                for alert_id, alert_info in share_info["alerts"].items():
+                    try:
+                        price = float(alert_info["price"])
+                    except:
+                        # Really just in case
+                        continue
+
+                    if old_close <= price and price <= new_close \
+                        or old_close >= price and price >= new_close \
+                        or current_price == price:
+                        _send_email(user.email, share["long_name"], price)
+
+
 initialize_app()
 
 
@@ -151,7 +256,13 @@ def get_stocks(req: https_fn.Request) -> https_fn.Response:
 #     _research_shares(share_tickers, crypto_tickers)
 
 
-@scheduler_fn.on_schedule(schedule="every 60 minutes")
+# @https_fn.on_request()
+# def TODO_REMOVE_alerts(req: https_fn.Request) -> https_fn.Response:
+#     _check_price_alerts()
+
+
+@scheduler_fn.on_schedule(schedule="every 1 minutes", timeout_sec=120)
 def update_stock_list(event: scheduler_fn.ScheduledEvent) -> None:
     _research_shares(share_tickers, crypto_tickers)
+    _check_price_alerts()
 
